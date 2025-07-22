@@ -1,11 +1,15 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <Adafruit_Fingerprint.h>
 
 #define BUTTON_PIN 13
 #define DEBOUNCE_DELAY 300
+
+#define MAX_RETRIES 3
+#define FOOD_COLLECTION_LIMIT 1
 
 bool isRegistrationMode = false;
 
@@ -13,8 +17,7 @@ HardwareSerial serialPort(2); // use UART2
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&serialPort);
 
 // System states
-enum SystemMode
-{
+enum SystemMode {
   COLLECTION_MODE,
   REGISTRATION_MODE
 };
@@ -26,7 +29,7 @@ const char *ssid = "iPhone 14 Plus";
 const char *password = "jbgadget2023";
 
 // Supabase settings
-const char *supabaseURL = "https://cskdjbpsiupasdhynazt.supabase.co/rest/v1/staff";
+const char *supabaseURL = "https://cskdjbpsiupasdhynazt.supabase.co/rest/v1";
 const char *supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNza2RqYnBzaXVwYXNkaHluYXp0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTI3NDM2MTIsImV4cCI6MjA2ODMxOTYxMn0.n5V-Jl2njI3AdzWuXcFjFjqCdD4xdqUf7OCcfEA8Ahg";
 
 void networkSetup(){
@@ -49,7 +52,25 @@ void checkWiFi(){
   }
 }
 
-uint8_t getFingerprintEnroll(uint8_t id){
+void checkSensorStorage(){
+  finger.begin(57600);
+  if (finger.verifyPassword()){
+    Serial.println("Found fingerprint sensor!");
+    uint16_t count = finger.getTemplateCount();
+    Serial.print("Sensor contains "); Serial.print(count); 
+    Serial.println(" templates");
+    
+    // Check sensor storage type
+    uint8_t ret = finger.getParameters();
+    if (ret == FINGERPRINT_OK) {
+      Serial.print("Status register: 0x"); Serial.println(finger.status_reg, HEX);
+      Serial.print("Capacity: "); Serial.println(finger.capacity);
+      Serial.print("Security level: "); Serial.println(finger.security_level);
+    }
+  }
+}
+
+uint8_t storeFingerprint(uint8_t id) {
   int p = -1;
   Serial.print("Waiting for valid finger to enroll as #");
   Serial.println(id);
@@ -167,12 +188,12 @@ void toggleMode(){
   }
 }
 
-void recordFoodCollection(int fingerprintID)
+bool recordFoodCollection(int fingerprintID)
 {
   if (WiFi.status() != WL_CONNECTED)
   {
     Serial.println(" No WiFi connection - can't record collection");
-    return;
+    return false;
   }
 
   HTTPClient http;
@@ -183,12 +204,6 @@ void recordFoodCollection(int fingerprintID)
     fullUrl += "/";
   }
   fullUrl += "food_collections";
-
-  if (!http.begin(fullUrl))
-  {
-    Serial.println("Failed to initialize HTTP connection");
-    return;
-  }
 
   String endpoint = String(supabaseURL) + "food_collections";
   http.begin(endpoint);
@@ -208,18 +223,14 @@ void recordFoodCollection(int fingerprintID)
   if (httpResponseCode == 201)
   {
     Serial.println(" Food collection recorded successfully");
+    return true;
   }
   else
   {
     Serial.print(" Error recording collection: ");
     Serial.println(httpResponseCode);
-    if (httpResponseCode > 0)
-    {
-      String response = http.getString();
-      Serial.println(response);
-    }
+    return false;
   }
-  http.end();
 }
 
 void addStaffToSupabase(int staffid, String staffname, int tag, int fingerprint_id)
@@ -238,12 +249,6 @@ void addStaffToSupabase(int staffid, String staffname, int tag, int fingerprint_
     fullUrl += "/";
   }
   fullUrl += "staff";
-
-  if (!http.begin(fullUrl))
-  {
-    Serial.println("Failed to initialize HTTP connection");
-    return;
-  }
 
   http.begin(String(supabaseURL));
   http.addHeader("Content-Type", "application/json");
@@ -298,6 +303,10 @@ void setup(){
   }
 
   checkWiFi();
+  checkSensorStorage();
+
+  bool verifyFingerprintAndStaff(int &matchedID);
+  void collectionMode();
 
   Serial.println("\nSystem initialized");
   Serial.print("Fingerprint templates stored: ");
@@ -423,3 +432,62 @@ void loop(){
     }
   }
 }
+
+bool verifyFingerprintAndStaff(int &matchedID){
+  matchedID = getFingerprintID();
+  if (matchedID < 0) {
+    Serial.println("No fingerprint match");
+    return false;
+  }
+
+  HTTPClient http;
+  String endpoint = String(supabaseURL) + "/staff?fingerprint_id=eq." + String(matchedID);
+  http.begin(endpoint);
+  http.addHeader("apikey", supabaseKey);
+  http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+
+  int httpCode = http.GET();
+  if(httpCode != 200){
+    Serial.println("Staff verfication failed");
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  if(payload == "[]"){
+    Serial.println("Staff not registered");
+    return false;
+  }
+
+  DynamicJsonDocument doc(1024);
+  deserializeJson(doc, payload);
+  int collectionsToday = doc.size();
+
+  if (collectionsToday >= FOOD_COLLECTION_LIMIT) {
+    Serial.print("Staff already collected");
+    Serial.print(collectionsToday);
+    Serial.println(" meals today");
+    return false;
+  }
+  return true;
+}
+
+void collectionMode(){
+  int matchedID = -1;
+  if (verifyFingerprintAndStaff(matchedID)) {
+    Serial.print("Verified staff #");
+    Serial.println(matchedID);
+    
+    if (recordFoodCollection(matchedID)) {
+      Serial.println("Meal recorded successfully");
+    } else {
+      Serial.println("Failed to record meal");
+    }
+  } else {
+    Serial.println("Verification failed");
+  }
+  delay(2000);
+}
+
