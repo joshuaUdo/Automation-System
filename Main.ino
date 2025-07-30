@@ -35,6 +35,8 @@ HTTPClient https;
 int findNextAvailableID();
 int getTagByFingerprint(int fid);
 bool hasCollectedToday(int tag);
+bool staffExists(int staffid);
+bool updateStaffFingerprint(int staffid, int fid);
 
 // ============= WiFi Connection ========================
 void connectToWiFi() {
@@ -55,7 +57,7 @@ String checkControlMode() {
   String url = String(supabase_url) +
                "/rest/v1/control?select=mode,staffid&processed=eq.false&limit=1";
 
-  Serial.println("Requesting: " + url);  // For debugging the full URL
+  Serial.println("Requesting: " + url);
 
   if (!http.begin(client, url)) {
     Serial.println("Failed to begin HTTP request");
@@ -67,6 +69,7 @@ String checkControlMode() {
   http.addHeader("Accept", "application/json");
 
   int responseCode = http.GET();
+  String payload = http.getString();
 
   if (responseCode != 200) {
     Serial.println("Failed to get control mode. HTTP code: " + String(responseCode));
@@ -76,23 +79,23 @@ String checkControlMode() {
     return "";
   }
 
-  String payload = http.getString();
   Serial.println("Control GET payload: " + payload);
 
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, payload);
+  http.end();
 
   if (error) {
     Serial.print("JSON deserialization failed: ");
     Serial.println(error.f_str());
-    http.end();
     return "";
   }
 
-  if (doc.size() == 0) {
-    Serial.println("No control record found");
-    http.end();
-    return "";
+  if (doc.is<JsonArray>() && doc.size() == 0) {
+    mode = "collection";
+    staffidToRegister = -1;
+    Serial.println("No unprocessed control. Defaulting to collection mode.");
+    return mode;
   }
 
   JsonObject first = doc[0];
@@ -101,7 +104,6 @@ String checkControlMode() {
 
   Serial.println("Control mode: " + mode + ", staffidToRegister: " + String(staffidToRegister));
 
-  http.end();
   return mode;
 }
 
@@ -145,13 +147,19 @@ void updateControlModeToCollection() {
 
 // ============= Fingerprint Enrollment ==================
 bool enrollFingerprint(int staffid) {
+  // Verify staff exists first
+  if (!staffExists(staffid)) {
+    Serial.println("Error: Staff ID " + String(staffid) + " not found");
+    return false;
+  }
+
   int id = findNextAvailableID();
   if (id == -1) {
     Serial.println("No available fingerprint slots");
     return false;
   }
 
-  Serial.println("Assigning fingerprint ID: " + String(id));
+  Serial.println("Assigning fingerprint ID: " + String(id) + " to staff ID: " + String(staffid));
   Serial.println("Place finger to enroll...");
 
   uint8_t p = -1;
@@ -190,6 +198,36 @@ bool enrollFingerprint(int staffid) {
 
   Serial.println("Fingerprint enrolled successfully!");
 
+  // Update staff record with fingerprint ID
+  return updateStaffFingerprint(staffid, id);
+}
+
+// ============= Helper Functions ==================
+
+bool staffExists(int staffid) {
+  HTTPClient http;
+  String url = String(supabase_url) + "/rest/v1/staff?staffid=eq." + String(staffid) + "&select=staffid";
+  
+  if (!http.begin(client, url)) {
+    Serial.println("Failed to begin HTTP connection");
+    return false;
+  }
+  
+  http.addHeader("apikey", supabase_apikey);
+  http.addHeader("Authorization", String("Bearer ") + supabase_apikey);
+  
+  int code = http.GET();
+  bool exists = (code == HTTP_CODE_OK);
+  http.end();
+  
+  if (!exists) {
+    Serial.println("Staff ID " + String(staffid) + " not found in database");
+  }
+  
+  return exists;
+}
+
+bool updateStaffFingerprint(int staffid, int fid) {
   HTTPClient http;
   String url = String(supabase_url) + "/rest/v1/staff?staffid=eq." + String(staffid);
 
@@ -204,7 +242,7 @@ bool enrollFingerprint(int staffid) {
   http.addHeader("Prefer", "return=minimal");
 
   JsonDocument doc;
-  doc["fingerprintid"] = id;
+  doc["fingerprintid"] = fid;
   String body;
   serializeJson(doc, body);
 
@@ -212,7 +250,7 @@ bool enrollFingerprint(int staffid) {
   Serial.println("Staff update response: " + String(res));
 
   if (res == HTTP_CODE_OK || res == HTTP_CODE_NO_CONTENT) {
-    Serial.println("Successfully updated staff record");
+    Serial.println("Successfully updated staff record with fingerprint ID");
     http.end();
     return true;
   } else {
@@ -232,6 +270,35 @@ int findNextAvailableID() {
   }
   return -1;
 }
+
+// ============= Get Staff ID by Fingerprint ==============
+int getStaffIdByFingerprint(int fid) {
+  HTTPClient http;
+  String url = String(supabase_url) + "/rest/v1/staff?fingerprintid=eq." + String(fid) + "&select=staffid";
+
+  if (!http.begin(client, url)) {
+    Serial.println("Failed to begin HTTP connection");
+    return -1;
+  }
+
+  http.addHeader("apikey", supabase_apikey);
+  http.addHeader("Authorization", String("Bearer ") + supabase_apikey);
+
+  int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error && doc.size() > 0) {
+      return doc[0]["staffid"];
+    }
+  }
+
+  http.end();
+  return -1;
+}
+
 
 // ====== Verify Fingerprint & Log Collection ============
 void verifyFingerprintAndLog() {
@@ -285,9 +352,18 @@ void verifyFingerprintAndLog() {
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Prefer", "return=minimal");
 
+  // Get staffid for this fingerprint
+  int staffid = getStaffIdByFingerprint(fid);
+  if (staffid == -1) {
+    Serial.println("Error: No staff ID found for fingerprint");
+    http.end();
+    return;
+  }
+
   JsonDocument doc;
   doc["fingerprintid"] = fid;
   doc["tag"] = tag;
+  doc["staffid"] = staffid; // Add staffid to satisfy not-null constraint
   String body;
   serializeJson(doc, body);
 
@@ -304,7 +380,8 @@ void verifyFingerprintAndLog() {
   http.end();
 }
 
-// ============= Get Tag by Fingerprint ID ===============
+
+// ============= Get Tag by Fingerprint ID ================
 int getTagByFingerprint(int fid) {
   HTTPClient http;
   String url = String(supabase_url) + "/rest/v1/staff?fingerprintid=eq." + String(fid) + "&select=tag";
