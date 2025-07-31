@@ -1,6 +1,7 @@
 //Automation System for fingerprint-based food collection
 //Designed for ESP32 with Adafruit Fingerprint Sensor
 #include <WiFi.h>
+#include <time.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -299,7 +300,6 @@ int getStaffIdByFingerprint(int fid) {
   return -1;
 }
 
-
 // ====== Verify Fingerprint & Log Collection ============
 void verifyFingerprintAndLog() {
   uint8_t p = finger.getImage();
@@ -352,6 +352,11 @@ void verifyFingerprintAndLog() {
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Prefer", "return=minimal");
 
+  time_t now = time(nullptr);
+  now += 3600; // Adjust for your timezone (3600 = +1 hour)
+  char timeStr[20];
+  strftime(timeStr, sizeof(timeStr), "%Y-%m-%dT%H:%M:%S+01:00", gmtime(&now));
+
   // Get staffid for this fingerprint
   int staffid = getStaffIdByFingerprint(fid);
   if (staffid == -1) {
@@ -364,11 +369,12 @@ void verifyFingerprintAndLog() {
   doc["fingerprintid"] = fid;
   doc["tag"] = tag;
   doc["staffid"] = staffid; // Add staffid to satisfy not-null constraint
+  doc["created_at"] = timeStr; // Use ISO 8601 format
+
   String body;
   serializeJson(doc, body);
 
   int code = http.POST(body);
-  Serial.println("Collection log response: " + String(code));
 
   if (code == HTTP_CODE_CREATED) {
     Serial.println("Successfully logged collection");
@@ -379,7 +385,6 @@ void verifyFingerprintAndLog() {
 
   http.end();
 }
-
 
 // ============= Get Tag by Fingerprint ID ================
 int getTagByFingerprint(int fid) {
@@ -412,6 +417,13 @@ int getTagByFingerprint(int fid) {
 // ============ Check if Already Collected ===============
 bool hasCollectedToday(int tag) {
   HTTPClient http;
+
+  time_t now = time(nullptr);
+  struct tm* timeinfo;
+  timeinfo = gmtime(&now);
+  char datestr[11];
+  strftime(datestr, sizeof(datestr), "%Y-%m-%d", timeinfo);
+
   String url = String(supabase_url) + "/rest/v1/food_collections?tag=eq." + String(tag) + "&select=tag&limit=1&order=created_at.desc";
 
   if (!http.begin(client, url)) {
