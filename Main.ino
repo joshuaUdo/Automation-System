@@ -4,6 +4,7 @@
 #include <time.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <sys/time.h>
 #include <ArduinoJson.h>
 #include <HardwareSerial.h>
 #include <Adafruit_Fingerprint.h>
@@ -50,6 +51,25 @@ void connectToWiFi() {
   Serial.println("\nConnected. IP: " + WiFi.localIP().toString());
 }
 
+//Time synchronization
+void syncTime() {
+  // NTP time sync for accurate time-based operations
+  configTime(3600, 0, "pool.ntp.org", "time.nist.gov");  // UTC+1
+
+  Serial.print("Waiting for time sync");
+  while (time(nullptr) < 100000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nTime synced!");
+
+  time_t now = time(nullptr);
+  struct tm* timeinfo = gmtime(&now);
+  Serial.printf("Current time (UTC): %04d-%02d-%02d %02d:%02d:%02d\n",
+                timeinfo->tm_year + 1900, timeinfo->tm_mon + 1,
+                timeinfo->tm_mday, timeinfo->tm_hour,
+                timeinfo->tm_min, timeinfo->tm_sec);
+}
 // =========== Check Supabase Control Mode =============
 String checkControlMode() {
   client.setInsecure();
@@ -368,8 +388,8 @@ void verifyFingerprintAndLog() {
   JsonDocument doc;
   doc["fingerprintid"] = fid;
   doc["tag"] = tag;
-  doc["staffid"] = staffid; // Add staffid to satisfy not-null constraint
-  doc["created_at"] = timeStr; // Use ISO 8601 format
+  doc["staffid"] = staffid; 
+  doc["time_collected"] = timeStr; 
 
   String body;
   serializeJson(doc, body);
@@ -416,39 +436,52 @@ int getTagByFingerprint(int fid) {
 
 // ============ Check if Already Collected ===============
 bool hasCollectedToday(int tag) {
-  HTTPClient http;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
 
-  time_t now = time(nullptr);
-  struct tm* timeinfo;
-  timeinfo = gmtime(&now);
-  char datestr[11];
-  strftime(datestr, sizeof(datestr), "%Y-%m-%d", timeinfo);
+  String url = String(supabase_url) + "/rest/v1/food_collections?tag=eq." + tag + "&select=time_collected&order=time_collected.desc&limit=1";
 
-  String url = String(supabase_url) + "/rest/v1/food_collections?tag=eq." + String(tag) + "&select=tag&limit=1&order=created_at.desc";
+  https.begin(client, url);
+  https.addHeader("apikey", supabase_apikey);
+  https.addHeader("Authorization", "Bearer " + String(supabase_apikey));
 
-  if (!http.begin(client, url)) {
-    Serial.println("Failed to begin HTTP connection");
-    return false;
-  }
+  int httpCode = https.GET();
+  if (httpCode > 0) {
+    String payload = https.getString();
+    Serial.println("Supabase response: " + payload);
 
-  http.addHeader("apikey", supabase_apikey);
-  http.addHeader("Authorization", String("Bearer ") + supabase_apikey);
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, payload);
+    if (doc.size() > 0) {
+      const char* createdAt = doc[0]["time_collected"];
+      struct tm tm;
+      if (strptime(createdAt, "%Y-%m-%dT%H:%M:%S", &tm)) {
+        time_t lastCollectionTime = mktime(&tm);
+        time_t now = time(nullptr);
 
-  int code = http.GET();
-  bool hasCollected = false;
+        // Guard: skip if time not synced
+        if (now < 100000) {
+          Serial.println("Time not synced! Allowing collection.");
+          return false;
+        }
 
-  if (code == HTTP_CODE_OK) {
-    String payload = http.getString();
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, payload);
+        struct tm* nowTm = gmtime(&now);
+        struct tm* lastTm = gmtime(&lastCollectionTime);
 
-    if (!error && doc.size() > 0) {
-      hasCollected = true;
+        if (nowTm->tm_year == lastTm->tm_year &&
+            nowTm->tm_yday == lastTm->tm_yday) {
+          Serial.println("Collection already done today.");
+          return true;
+        }
+      }
     }
+  } else {
+    Serial.println("HTTP error: " + String(httpCode));
   }
 
-  http.end();
-  return hasCollected;
+  https.end();
+  return false;
 }
 
 // ====================== Setup =========================
@@ -461,6 +494,7 @@ void setup() {
 
   Serial.println("Initializing system...");
   connectToWiFi();
+  syncTime();
 
   if(!finger.verifyPassword()){
     Serial.println("Fingerprint sensor not found.");
