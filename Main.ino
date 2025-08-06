@@ -1,17 +1,26 @@
 //Automation System for fingerprint-based food collection
 //Designed for ESP32 with Adafruit Fingerprint Sensor
+#include <SPI.h>
 #include <WiFi.h>
 #include <time.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
+#include <TFT_eSPI.h>
 #include <sys/time.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <HardwareSerial.h>
+#include <WiFiClientSecure.h>
 #include <Adafruit_Fingerprint.h>
+
+//Headers for the images
+#include <Images.h>
 
 // WiFi credentials
 const char* ssid = "iPhone 14 Plus";
 const char* password = "jbgadget2023";
+
+// WiFi client
+WiFiClientSecure client;
+HTTPClient https;
 
 // Supabase
 const char* supabase_url = "https://cskdjbpsiupasdhynazt.supabase.co";
@@ -21,17 +30,23 @@ const char* supabase_apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJz
 #define RX_PIN 16
 #define TX_PIN 17
 
+// Display pins
+#define DISPLAYRX 2
+#define DISPLAYTX 4
+
+#define BUZZER_PIN 13
+
 // Fingerprint sensor on UART1
 HardwareSerial mySerial(1);
 Adafruit_Fingerprint finger(&mySerial);
 
+//Display object
+HardwareSerial displaySerial(2);
+TFT_eSPI tft = TFT_eSPI();
+
 // State
 String mode = "collection";
 int staffidToRegister = -1;
-
-// WiFi client
-WiFiClientSecure client;
-HTTPClient https;
 
 // Forward declarations
 int findNextAvailableID();
@@ -51,25 +66,36 @@ void connectToWiFi() {
   Serial.println("\nConnected. IP: " + WiFi.localIP().toString());
 }
 
-//Time synchronization
-void syncTime() {
-  // NTP time sync for accurate time-based operations
-  configTime(3600, 0, "pool.ntp.org", "time.nist.gov");  // UTC+1
 
-  Serial.print("Waiting for time sync");
-  while (time(nullptr) < 100000) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nTime synced!");
+// NTP time sync for accurate time-based operations
+void syncTime() {
+  Serial.println("Syncing time via NTP...");
+
+  // Set local timezone to WAT (West Africa Time)
+  configTzTime("WAT-1", "pool.ntp.org", "time.nist.gov");  // UTC+1
 
   time_t now = time(nullptr);
-  struct tm* timeinfo = gmtime(&now);
-  Serial.printf("Current time (UTC): %04d-%02d-%02d %02d:%02d:%02d\n",
-                timeinfo->tm_year + 1900, timeinfo->tm_mon + 1,
-                timeinfo->tm_mday, timeinfo->tm_hour,
-                timeinfo->tm_min, timeinfo->tm_sec);
+  int attempts = 0;
+
+  while (now < 100000 && attempts < 20) {  // Try for 10 seconds max
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+    attempts++;
+  }
+
+  if (now < 100000) {
+    Serial.println("Time sync failed!");
+  } else {
+    Serial.println("Time synced!");
+    struct tm* timeinfo = localtime(&now); 
+    Serial.printf("Current time (WAT): %04d-%02d-%02d %02d:%02d:%02d\n",
+                  timeinfo->tm_year + 1900, timeinfo->tm_mon + 1,
+                  timeinfo->tm_mday, timeinfo->tm_hour,
+                  timeinfo->tm_min, timeinfo->tm_sec);
+  }
 }
+
 // =========== Check Supabase Control Mode =============
 String checkControlMode() {
   client.setInsecure();
@@ -167,7 +193,7 @@ void updateControlModeToCollection() {
 }
 
 // ============= Fingerprint Enrollment ==================
-bool enrollFingerprint(int staffid) {
+bool enrollFingerprint(int staffid, unsigned long timeout = 30000) {
   // Verify staff exists first
   if (!staffExists(staffid)) {
     Serial.println("Error: Staff ID " + String(staffid) + " not found");
@@ -183,48 +209,60 @@ bool enrollFingerprint(int staffid) {
   Serial.println("Assigning fingerprint ID: " + String(id) + " to staff ID: " + String(staffid));
   Serial.println("Place finger to enroll...");
 
-  uint8_t p = -1;
+  unsigned long startTime = millis();
+  uint8_t p;
+
   while ((p = finger.getImage()) != FINGERPRINT_OK) {
-    if (p == FINGERPRINT_NOFINGER) continue;
-    Serial.println("Error capturing image: " + String(p));
-    return false;
+    if (millis() - startTime > timeout) {
+      Serial.println("Enrollment timed out (first image)");
+      return false;
+    }
+    delay(100);
   }
 
   if (finger.image2Tz(1) != FINGERPRINT_OK) {
-    Serial.println("Error creating template 1");
+    Serial.println("Error converting first image");
     return false;
   }
 
-  Serial.println("Remove finger");
-  delay(2000);
-  while (finger.getImage() != FINGERPRINT_NOFINGER);
+  Serial.println("Remove finger...");
+  while (finger.getImage() != FINGERPRINT_NOFINGER) {
+    if (millis() - startTime > timeout) {
+      Serial.println("Timeout waiting for finger to be removed");
+      return false;
+    }
+    delay(50);
+  }
 
-  Serial.println("Place same finger again");
-  while ((p = finger.getImage()) != FINGERPRINT_OK);
+  Serial.println("Place same finger again...");
+  while ((p = finger.getImage()) != FINGERPRINT_OK) {
+    if (millis() - startTime > timeout) {
+      Serial.println("Timeout waiting for second placement");
+      return false;
+    }
+    delay(100);
+  }
 
   if (finger.image2Tz(2) != FINGERPRINT_OK) {
-    Serial.println("Error creating template 2");
+    Serial.println("Error converting second image");
     return false;
   }
 
   if (finger.createModel() != FINGERPRINT_OK) {
-    Serial.println("Fingerprints didn't match");
+    Serial.println("Fingerprints did not match");
     return false;
   }
 
   if (finger.storeModel(id) != FINGERPRINT_OK) {
-    Serial.println("Failed to store model");
+    Serial.println("Failed to store fingerprint");
     return false;
   }
 
   Serial.println("Fingerprint enrolled successfully!");
-
-  // Update staff record with fingerprint ID
   return updateStaffFingerprint(staffid, id);
 }
 
 // ============= Helper Functions ==================
-
 bool staffExists(int staffid) {
   HTTPClient http;
   String url = String(supabase_url) + "/rest/v1/staff?staffid=eq." + String(staffid) + "&select=staffid";
@@ -435,12 +473,13 @@ int getTagByFingerprint(int fid) {
 }
 
 // ============ Check if Already Collected ===============
-bool hasCollectedToday(int tag) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient https;
 
-  String url = String(supabase_url) + "/rest/v1/food_collections?tag=eq." + tag + "&select=time_collected&order=time_collected.desc&limit=1";
+bool hasCollectedToday(int staffid) {
+  client.setInsecure();
+
+  String url = String(supabase_url) +
+    "/rest/v1/food_collections?staffid=eq." + String(staffid) +
+    "&select=time_collected&order=time_collected.desc&limit=1";
 
   https.begin(client, url);
   https.addHeader("apikey", supabase_apikey);
@@ -454,51 +493,44 @@ bool hasCollectedToday(int tag) {
     DynamicJsonDocument doc(1024);
     deserializeJson(doc, payload);
     if (doc.size() > 0) {
-      const char* createdAt = doc[0]["time_collected"];
+      const char* lastTime = doc[0]["time_collected"];
       struct tm tm;
-      if (strptime(createdAt, "%Y-%m-%dT%H:%M:%S", &tm)) {
-        time_t lastCollectionTime = mktime(&tm);
+      if (strptime(lastTime, "%Y-%m-%dT%H:%M:%S", &tm)) {
+        time_t lastCollection = mktime(&tm);
         time_t now = time(nullptr);
 
-        // Guard: skip if time not synced
-        if (now < 100000) {
-          Serial.println("Time not synced! Allowing collection.");
-          return false;
-        }
+        struct tm* nowTm = localtime(&now);
+        struct tm* lastTm = localtime(&lastCollection);
 
-        struct tm* nowTm = gmtime(&now);
-        struct tm* lastTm = gmtime(&lastCollectionTime);
-
+        // Check if same calendar day
         if (nowTm->tm_year == lastTm->tm_year &&
             nowTm->tm_yday == lastTm->tm_yday) {
-          Serial.println("Collection already done today.");
-          return true;
+          return true;  // Already collected today
         }
       }
     }
-  } else {
-    Serial.println("HTTP error: " + String(httpCode));
   }
 
   https.end();
-  return false;
+  return false;  // No collection today
 }
+
+void showImages(){}
 
 // ====================== Setup =========================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-
+  delay(200);
   mySerial.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
-  delay(1000);
 
-  Serial.println("Initializing system...");
+  pinMode(BUZZER_PIN, OUTPUT);
+
   connectToWiFi();
   syncTime();
-
-  if(!finger.verifyPassword()){
+ 
+  if (!finger.verifyPassword()) {
     Serial.println("Fingerprint sensor not found.");
-    while(1) delay(10);
+    while (1) delay(10);
   }
 }
 
@@ -506,24 +538,38 @@ void setup() {
 void loop() {
   static unsigned long lastCheck = 0;
 
+  // Poll Supabase for control mode every 3 seconds
   if (millis() - lastCheck >= 3000) {
     lastCheck = millis();
     checkControlMode();
   }
 
+  // Handle registration mode
   if (mode == "register" && staffidToRegister > 0) {
-    if (enrollFingerprint(staffidToRegister)) {
-      updateControlModeToCollection();
+    Serial.println("Entering registration mode...");
+
+    bool enrolled = enrollFingerprint(staffidToRegister, 30000); 
+
+    if (enrolled) {
+      Serial.println("Enrollment successful");
+    } else {
+      Serial.println("Enrollment failed or timed out");
     }
-    staffidToRegister = -1;
-  } 
-  else if (mode == "collection") {
-    verifyFingerprintAndLog();
-    delay(500);
+
+    updateControlModeToCollection();  // Reset to collection mode either way
+    staffidToRegister = -1;           // Clear current staff ID
+    mode = "collection";              // Ensure mode is switched locally too
   }
 
+  // Handle collection mode
+  else if (mode == "collection") {
+    verifyFingerprintAndLog();
+    delay(500); // Small delay to avoid overloading sensor
+  }
+
+  // Reconnect WiFi if disconnected
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi connection lost");
+    Serial.println("WiFi connection lost. Reconnecting...");
     delay(1000);
     connectToWiFi();
   }
