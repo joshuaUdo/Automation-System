@@ -255,10 +255,12 @@ bool enrollFingerprint(int staffid, unsigned long timeout = 30000) {
 
   if (finger.storeModel(id) != FINGERPRINT_OK) {
     Serial.println("Failed to store fingerprint");
+    errorBeep();
     return false;
   }
 
   Serial.println("Fingerprint enrolled successfully!");
+  successBeep();
   return updateStaffFingerprint(staffid, id);
 }
 
@@ -436,9 +438,11 @@ void verifyFingerprintAndLog() {
 
   if (code == HTTP_CODE_CREATED) {
     Serial.println("Successfully logged collection");
+    successBeep();
   } else {
     String response = http.getString();
     Serial.println("Failed to log collection. Response: " + response);
+    errorBeep();
   }
 
   http.end();
@@ -473,7 +477,6 @@ int getTagByFingerprint(int fid) {
 }
 
 // ============ Check if Already Collected ===============
-
 bool hasCollectedToday(int staffid) {
   client.setInsecure();
 
@@ -516,6 +519,16 @@ bool hasCollectedToday(int staffid) {
 }
 
 void showImages(){}
+
+void successBeep(){
+  tone(BUZZER_PIN, 1000, 150);
+  delay(200);
+}
+
+void errorBeep(){
+  tone(BUZZER_PIN, 500, 300);
+  delay(350);
+}
 
 // ====================== Setup =========================
 void setup() {
