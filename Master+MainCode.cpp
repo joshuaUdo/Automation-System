@@ -11,12 +11,9 @@
 #include <WiFiClientSecure.h>
 #include <Adafruit_Fingerprint.h>
 
-//Headers for the images
-#include <Images.h>
-
 // WiFi credentials
-const char* ssid = "iPhone 14 Plus";
-const char* password = "jbgadget2023";
+const char* ssid = "iPhone 14 Plus"; //Replace with your network details
+const char* password = "jbgadget2023"; //Replace with your network details
 
 // WiFi client
 WiFiClientSecure client;
@@ -31,8 +28,8 @@ const char* supabase_apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJz
 #define TX_PIN 17
 
 // Display pins
-#define DISPLAYRX 2
-#define DISPLAYTX 4
+#define DISPLAYRX 22
+#define DISPLAYTX 23
 
 #define BUZZER_PIN 13
 
@@ -66,7 +63,6 @@ void connectToWiFi() {
   Serial.println("\nConnected. IP: " + WiFi.localIP().toString());
 }
 
-
 // NTP time sync for accurate time-based operations
 void syncTime() {
   Serial.println("Syncing time via NTP...");
@@ -94,6 +90,21 @@ void syncTime() {
                   timeinfo->tm_mday, timeinfo->tm_hour,
                   timeinfo->tm_min, timeinfo->tm_sec);
   }
+}
+
+void successBeep(){
+  tone(BUZZER_PIN, 1000, 150);
+  delay(200);
+}
+
+void errorBeep(){
+  tone(BUZZER_PIN, 500, 300);
+  delay(350);
+}
+
+void sendToDisplay(const String &cmd){
+  displaySerial.println(cmd);
+  displaySerial.print('\n');
 }
 
 // =========== Check Supabase Control Mode =============
@@ -208,6 +219,8 @@ bool enrollFingerprint(int staffid, unsigned long timeout = 30000) {
 
   Serial.println("Assigning fingerprint ID: " + String(id) + " to staff ID: " + String(staffid));
   Serial.println("Place finger to enroll...");
+  sendToDisplay("show_register_1");
+
 
   unsigned long startTime = millis();
   uint8_t p;
@@ -235,6 +248,8 @@ bool enrollFingerprint(int staffid, unsigned long timeout = 30000) {
   }
 
   Serial.println("Place same finger again...");
+  sendToDisplay("show_register_2");
+
   while ((p = finger.getImage()) != FINGERPRINT_OK) {
     if (millis() - startTime > timeout) {
       Serial.println("Timeout waiting for second placement");
@@ -261,6 +276,7 @@ bool enrollFingerprint(int staffid, unsigned long timeout = 30000) {
 
   Serial.println("Fingerprint enrolled successfully!");
   successBeep();
+  sendToDisplay("show_success");
   return updateStaffFingerprint(staffid, id);
 }
 
@@ -396,6 +412,7 @@ void verifyFingerprintAndLog() {
 
   if (hasCollectedToday(tag)) {
     Serial.println("Tag " + String(tag) + " already collected today");
+    sendToDisplay("show_error");
     return;
   }
 
@@ -438,10 +455,12 @@ void verifyFingerprintAndLog() {
 
   if (code == HTTP_CODE_CREATED) {
     Serial.println("Successfully logged collection");
+    sendToDisplay("show_success");
     successBeep();
   } else {
     String response = http.getString();
     Serial.println("Failed to log collection. Response: " + response);
+    sendToDisplay("show_error");
     errorBeep();
   }
 
@@ -509,6 +528,7 @@ bool hasCollectedToday(int staffid) {
         if (nowTm->tm_year == lastTm->tm_year &&
             nowTm->tm_yday == lastTm->tm_yday) {
           return true;  // Already collected today
+          sendToDisplay("show_error");
         }
       }
     }
@@ -518,23 +538,13 @@ bool hasCollectedToday(int staffid) {
   return false;  // No collection today
 }
 
-void showImages(){}
-
-void successBeep(){
-  tone(BUZZER_PIN, 1000, 150);
-  delay(200);
-}
-
-void errorBeep(){
-  tone(BUZZER_PIN, 500, 300);
-  delay(350);
-}
-
 // ====================== Setup =========================
 void setup() {
   Serial.begin(115200);
   delay(200);
   mySerial.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
+
+  displaySerial.begin(115200, SERIAL_8N1, DISPLAYRX, DISPLAYTX);
 
   pinMode(BUZZER_PIN, OUTPUT);
 
@@ -565,6 +575,8 @@ void loop() {
 
     if (enrolled) {
       Serial.println("Enrollment successful");
+      mySerial.println("show_success");
+
     } else {
       Serial.println("Enrollment failed or timed out");
     }
